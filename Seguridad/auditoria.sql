@@ -89,7 +89,13 @@ order by event_time desc;
 go
 
 -- 6. verificacion de la configuracion
-select name, is_state_enabled, type_desc from sys.server_audits;
+use gimnasio;
+go
+
+select name, status_desc, audit_file_path from sys.dm_server_audit_status
+where name = 'audit_gimnasio';
+select name, is_state_enabled, type_desc from sys.server_audits
+where name = 'audit_gimnasio';
 select name, is_state_enabled from sys.server_audit_specifications;
 select name, is_state_enabled from sys.database_audit_specifications;
 go
