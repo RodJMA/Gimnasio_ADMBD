@@ -20,13 +20,20 @@ GO
 DROP INDEX IF EXISTS IX_pago_pagado_membresia_fecha ON ventas.pago;
 GO
 
-WITH pagos_socio AS (
+WITH PagosAgrupados AS (
+    SELECT  id_membresia,
+            SUM(monto) AS monto_membresia,
+            COUNT(*)   AS conteo_membresia
+    FROM    ventas.pago
+    WHERE   estado = 'PAGADO'
+    GROUP BY id_membresia
+),
+pagos_socio AS (
     SELECT  m.id_socio,
-            SUM(p.monto) AS total_pagado,
-            COUNT(*)     AS num_pagos
-    FROM    ventas.pago p
-    JOIN    ventas.membresia m ON m.id_membresia = p.id_membresia
-    WHERE   p.estado = 'PAGADO'
+            SUM(pa.monto_membresia) AS total_pagado,
+            SUM(pa.conteo_membresia) AS num_pagos
+    FROM    PagosAgrupados pa
+    JOIN    ventas.membresia m ON m.id_membresia = pa.id_membresia
     GROUP BY m.id_socio
 )
 SELECT  s.id_socio, s.nombre, s.apellido,
@@ -54,30 +61,51 @@ GO
    INDICE: el mismo IX_pago_pagado_membresia_fecha (clave = PARTITION BY
    id_membresia + ORDER BY fecha_pago, id_pago).
    ===================================================================== */
+   
+   DROP INDEX IF EXISTS IX_pago_pagado_membresia_fecha ON ventas.pago;
+   GO
 
+WITH PagosProcesados AS (
+    SELECT  id_membresia,
+            fecha_pago,
+            id_pago,
+            monto,
+            ROW_NUMBER() OVER (
+                PARTITION BY id_membresia 
+                ORDER BY fecha_pago, id_pago
+            ) AS nro_pago,
+            SUM(monto) OVER (
+                PARTITION BY id_membresia 
+                ORDER BY fecha_pago, id_pago 
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ) AS acumulado,
+            LAG(fecha_pago) OVER (
+                PARTITION BY id_membresia 
+                ORDER BY fecha_pago, id_pago
+            ) AS fecha_anterior
+    FROM    ventas.pago
+    WHERE   estado = 'PAGADO'
+)
 SELECT  m.id_socio,
-        p.id_membresia,
-        pm.nombre                                        AS plan_,
-        pm.precio                                        AS precio_plan,
-        p.fecha_pago,
-        p.monto,
-        ROW_NUMBER() OVER (PARTITION BY p.id_membresia
-                           ORDER BY p.fecha_pago, p.id_pago)            AS nro_pago,
-        SUM(p.monto) OVER (PARTITION BY p.id_membresia
-                           ORDER BY p.fecha_pago, p.id_pago
-                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS acumulado,
-        pm.precio - SUM(p.monto) OVER (PARTITION BY p.id_membresia
-                           ORDER BY p.fecha_pago, p.id_pago
-                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS saldo_pendiente,
-        DATEDIFF(DAY,
-                 LAG(p.fecha_pago) OVER (PARTITION BY p.id_membresia
-                                         ORDER BY p.fecha_pago, p.id_pago),
-                 p.fecha_pago)                           AS dias_desde_pago_anterior
-FROM    ventas.pago p
-JOIN    ventas.membresia m       ON m.id_membresia = p.id_membresia
+        pp.id_membresia,
+        pm.nombre AS plan_,
+        pm.precio AS precio_plan,
+        pp.fecha_pago,
+        pp.monto,
+        pp.nro_pago,
+        pp.acumulado,
+        pm.precio - pp.acumulado AS saldo_pendiente,
+        DATEDIFF(DAY, pp.fecha_anterior, pp.fecha_pago) AS dias_desde_pago_anterior
+FROM    PagosProcesados pp
+JOIN    ventas.membresia m ON m.id_membresia = pp.id_membresia
 JOIN    ventas.plan_membresia pm ON pm.id_plan     = m.id_plan
-WHERE   p.estado = 'PAGADO'
-ORDER BY p.id_membresia, p.fecha_pago, p.id_pago;
+ORDER BY pp.id_membresia, pp.fecha_pago, pp.id_pago;
+GO
+
+CREATE NONCLUSTERED INDEX IX_pago_pagado_membresia_fecha
+    ON ventas.pago (id_membresia, fecha_pago, id_pago)
+    INCLUDE (monto)
+    WHERE estado = 'PAGADO';
 GO
 
 
@@ -90,28 +118,29 @@ GO
 DROP INDEX IF EXISTS IX_clase_entrenador_dia ON operaciones.clase;
 GO
 
-WITH agenda AS (
-    SELECT  c.id_clase, c.id_entrenador, c.id_sala, c.fecha,
-            c.hora_inicio, c.hora_fin,
-            ROW_NUMBER() OVER (PARTITION BY c.id_entrenador, c.fecha
-                               ORDER BY c.hora_inicio, c.id_clase) AS nro_del_dia,
-            COUNT(*)     OVER (PARTITION BY c.id_entrenador, c.fecha) AS clases_del_dia,
-            LAG(c.hora_fin)      OVER (PARTITION BY c.id_entrenador, c.fecha
-                                       ORDER BY c.hora_inicio, c.id_clase) AS fin_clase_anterior,
-            LEAD(c.hora_inicio)  OVER (PARTITION BY c.id_entrenador, c.fecha
-                                       ORDER BY c.hora_inicio, c.id_clase) AS inicio_clase_siguiente
-    FROM    operaciones.clase c
-    WHERE   c.estado <> 'CANCELADA'
+WITH conteo_clases AS (
+    SELECT  id_clase, id_entrenador, fecha, hora_inicio, hora_fin,
+            COUNT(*) OVER (PARTITION BY id_entrenador, fecha) AS clases_del_dia
+    FROM    operaciones.clase
+    WHERE   estado <> 'CANCELADA'
+),
+agenda_filtrada AS (
+    SELECT  id_entrenador, fecha, hora_inicio, hora_fin, clases_del_dia,
+            ROW_NUMBER() OVER (PARTITION BY id_entrenador, fecha
+                               ORDER BY hora_inicio, id_clase) AS nro_del_dia,
+            LAG(hora_fin) OVER (PARTITION BY id_entrenador, fecha
+                                ORDER BY hora_inicio, id_clase) AS fin_clase_anterior
+    FROM    conteo_clases
+    WHERE   clases_del_dia > 1
 )
-SELECT  e.nombre + ' ' + e.apellido                          AS entrenador,
+SELECT  e.nombre + ' ' + e.apellido AS entrenador,
         a.fecha, a.nro_del_dia, a.clases_del_dia,
         a.hora_inicio, a.hora_fin,
         DATEDIFF(MINUTE, a.fin_clase_anterior, a.hora_inicio) AS minutos_libres_antes,
         CASE WHEN a.hora_inicio < a.fin_clase_anterior
-             THEN 'TRASLAPE' ELSE 'OK' END                    AS estado_agenda
-FROM    agenda a
+             THEN 'TRASLAPE' ELSE 'OK' END AS estado_agenda
+FROM    agenda_filtrada a
 JOIN    personal.entrenador e ON e.id_entrenador = a.id_entrenador
-WHERE   a.clases_del_dia > 1
 ORDER BY a.id_entrenador, a.fecha, a.nro_del_dia;
 GO
 
